@@ -16,11 +16,11 @@
 package org.universAAL.ri.gateway;
 
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -52,7 +52,6 @@ import org.universAAL.ri.gateway.utils.ArraySet;
  * There should only be one {@link Exporter} per ASG.
  * 
  * @author amedrano
- * @TODO adapt to new tracker interface
  */
 public class Exporter implements IBusMemberRegistryListener {
 
@@ -86,8 +85,8 @@ public class Exporter implements IBusMemberRegistryListener {
      */
     public Exporter(final ProxyPool pool) {
 	this.pool = pool;
-	tracked = new HashMap<String, Resource[]>();
-	exported = new HashMap<String, ProxyBusMember>();
+	tracked = new ConcurrentHashMap<String, Resource[]>();
+	exported = new ConcurrentHashMap<String, ProxyBusMember>();
 	executor = Executors.newSingleThreadExecutor();
     }
 
@@ -162,13 +161,14 @@ public class Exporter implements IBusMemberRegistryListener {
      * @param session
      */
     public void activatedSession(final Session session) {
-	new Thread(new Runnable() {
-	    public void run() {
-		for (final String bmId : tracked.keySet()) {
-		    checkAndExport(bmId, session);
-		}
-	    }
-	}, "Exporter-Activation").start();
+    	Runnable task = new Runnable() {
+    		public void run() {
+    			for (final String bmId : tracked.keySet()) {
+    				checkAndExport(bmId, session);
+    			}
+    		}
+    	};
+    	executor.execute(task);
     }
 
     /**
@@ -181,20 +181,24 @@ public class Exporter implements IBusMemberRegistryListener {
      * @param session
      */
     public void stopedSession(final Session session) {
-	final Collection<Entry<String, ProxyBusMember>> ex = exported
-		.entrySet();
-	Set<String> tbr = new HashSet<String>();
-	for (final Entry<String, ProxyBusMember> entry : ex) {
-	    final ProxyBusMember pbm = entry.getValue();
-	    pbm.removeRemoteProxyReferences(session);
-	    if (pool.removeProxyIfOrphan(pbm)) {
-		tbr.add(entry.getKey());
-	    }
-	}
-	for (String id : tbr) {
-	    exported.remove(id);
-	}
-
+    	Runnable task = new Runnable() {
+    		public void run() {
+    			final Collection<Entry<String, ProxyBusMember>> ex = exported
+    					.entrySet();
+    			Set<String> tbr = new HashSet<String>();
+    			for (final Entry<String, ProxyBusMember> entry : ex) {
+    				final ProxyBusMember pbm = entry.getValue();
+    				pbm.removeRemoteProxyReferences(session);
+    				if (pool.removeProxyIfOrphan(pbm)) {
+    					tbr.add(entry.getKey());
+    				}
+    			}
+    			for (String id : tbr) {
+    				exported.remove(id);
+    			}
+    		}
+    	};
+    	executor.execute(task);
     }
 
     /**
@@ -226,18 +230,20 @@ public class Exporter implements IBusMemberRegistryListener {
 	// and they are not imported proxies!
     }
 
-    public synchronized void busMemberAdded(final BusMember member,
-	    final BusType type) {
-	if (isExportable(member)) {
-	    // mark as ready to receive params.
-	    // TODO check for errors: is this really the first time the
-	    // busMember is added?
-	    tracked.put(member.getURI(), null);
-	    Resource[] initParams = ProxyBusMemberFactory.initialParameters(member);
-	    if (initParams != null){
-		regParamsAdded(member.getURI(), initParams);
-	    }
-	}
+    public void busMemberAdded(final BusMember member,
+    		final BusType type) {
+
+    	if (isExportable(member)) {
+    		// mark as ready to receive params.
+    		// TODO check for errors: is this really the first time the
+    		// busMember is added?
+    		tracked.put(member.getURI(), null);
+    		Resource[] initParams = ProxyBusMemberFactory
+    				.initialParameters(member);
+    		if (initParams != null) {
+    			regParamsAdded(member.getURI(), initParams);
+    		}
+    	}
     }
 
     /**
@@ -246,35 +252,43 @@ public class Exporter implements IBusMemberRegistryListener {
      * Initiates Import-remove protocol: <br>
      * <img src="doc-files/Import-ImportRemove.png">
      */
-    public synchronized void busMemberRemoved(final BusMember member,
-	    final BusType type) {
-	final String bmId = member.getURI();
-	if (tracked.containsKey(bmId)) {
-	    // get proxy representative
-	    final ProxyBusMember pbm = exported.get(bmId);
-	    tracked.remove(bmId);
-	    exported.remove(bmId);
-	    if (pbm == null){
-		return;
-	    }
-	    // if there are no left busmembers that use this export proxy
-	    if (!exported.values().contains(pbm)) {
-		// then remove proxy.
-		LogUtils.logDebug(Gateway.getInstance().context, getClass(),
-			"busMemberRemoved",
-			"All local BusMember for proxy have been un registered, removing proxy");
-		pool.removeProxyWithSend(pbm);
-	    }
-	}
+    public void busMemberRemoved(final BusMember member,
+    		final BusType type) {
+    	
+    			final String bmId = member.getURI();
+    			if (tracked.containsKey(bmId)) {
+    				// get proxy representative
+    				final ProxyBusMember pbm = exported.get(bmId);
+    				tracked.remove(bmId);
+    				exported.remove(bmId);
+    				if (pbm == null) {
+    					return;
+    				}
+    				Runnable task = new Runnable() {
+    					public void run() {
+    						// if there are no left busmembers that use this export proxy
+    						if (!exported.values().contains(pbm)) {
+    							// then remove proxy.
+    							LogUtils.logDebug(Gateway.getInstance().context,
+    									getClass(), "busMemberRemoved",
+    									"All local BusMember for proxy have been un registered, removing proxy");
+    							pool.removeProxyWithSend(pbm);
+    						}
+    					}
+    				};
+    				executor.execute(task);
+    			}
     }
 
     /** {@inheritDoc} */
-    public synchronized void regParamsAdded(final String busMemberID,
+    public void regParamsAdded(final String busMemberID,
 	    final Resource[] params) {
 
 	final Resource[] currentParams = tracked.get(busMemberID);
 
-	if (tracked.containsKey(busMemberID) && currentParams == null) {
+	boolean isContained = tracked.containsKey(busMemberID);
+	
+	if (isContained && currentParams == null) {
 	    // a virgin busmember has registered, ie a newBusMember!
 	    tracked.put(busMemberID, params);
 	    executor.execute(new Runnable() {
@@ -283,7 +297,7 @@ public class Exporter implements IBusMemberRegistryListener {
 		}
 	    });
 	    ;
-	} else if (tracked.containsKey(busMemberID) && currentParams != null) {
+	} else if (isContained && currentParams != null) {
 	    tracked.put(busMemberID, new ArraySet.Union<Resource>().combine(
 		    currentParams, params, new Resource[] {}));
 	    executor.execute(new Runnable() {
@@ -297,7 +311,7 @@ public class Exporter implements IBusMemberRegistryListener {
     }
 
     /** {@inheritDoc} */
-    public synchronized void regParamsRemoved(final String busMemberID,
+    public void regParamsRemoved(final String busMemberID,
 	    final Resource[] params) {
 	/*
 	 * TODO check if new params of the BusMember is [], Then ???
@@ -401,6 +415,9 @@ public class Exporter implements IBusMemberRegistryListener {
 	return false;
     }
 
+    /**
+     * Immediately stop all operations.
+     */
     public synchronized void stop() {
 	// Hardcore stop all pending tasks
 	executor.shutdownNow();
